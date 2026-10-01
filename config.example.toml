@@ -1,0 +1,64 @@
+# Solana Sniper Bot Configuration
+# Copy this file to config.toml and customize
+
+[rpc]
+# Solana RPC endpoint (use a private RPC for best performance)
+endpoint = "https://api.mainnet-beta.solana.com"
+# WebSocket endpoint (optional, defaults to ws version of endpoint)
+# ws_endpoint = "wss://api.mainnet-beta.solana.com"
+# Commitment level: processed, confirmed, finalized
+commitment = "confirmed"
+# Request timeout in milliseconds
+timeout_ms = 30000
+
+# Optional: Geyser gRPC for lower latency (recommended for production)
+# [geyser]
+# endpoint = "your-geyser-endpoint:10000"
+# token = "your-auth-token"
+# tls = true
+
+[wallet]
+# Path to your wallet keypair JSON file
+keypair_path = "/path/to/your/keypair.json"
+# Additional wallets for parallel execution (optional)
+# additional_keypairs = ["/path/to/wallet2.json", "/path/to/wallet3.json"]
+
+[strategy]
+# Maximum SOL to spend per snipe
+max_buy_sol = 0.1
+# Minimum pool liquidity in SOL to trigger snipe
+min_liquidity_sol = 1.0
+# Maximum pool age in seconds (older pools are ignored)
+max_pool_age_secs = 60
+# Slippage tolerance (0.15 = 15%)
+slippage = 0.15
+# Enable pump.fun pool detection
+pump_fun_enabled = true
+# Enable Raydium pool detection
+raydium_enabled = false
+# Blacklisted token mints (known rugs/scams)
+blacklist = []
+# Only snipe from these creators (leave empty to allow all)
+creator_whitelist = []
+
+[execution]
+# Use Jito bundles for MEV protection
+jito_enabled = false
+# Jito block engine endpoint
+# jito_endpoint = "https://mainnet.block-engine.jito.wtf"
+# Priority fee in microlamports (higher = faster inclusion)
+priority_fee_microlamports = 100000
+# Number of retry attempts
+max_retries = 3
+# Compute unit limit
+compute_unit_limit = 200000
+# Simulate transaction before sending
+simulate_first = true
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log to file (optional)
+# file = "sniper.log"
+# JSON formatted logs
+json = false
