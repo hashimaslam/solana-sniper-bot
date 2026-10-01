@@ -1,0 +1,30 @@
+[package]
+name = "sniper-executor"
+description = "Transaction building, signing, and submission for sniping"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sniper-core = { workspace = true }
+
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+spl-token = { workspace = true }
+spl-associated-token-account = { workspace = true }
+solana-transaction-status = { workspace = true }
+
+tokio = { workspace = true }
+async-trait = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+borsh = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+
+reqwest = { workspace = true }
