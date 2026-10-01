@@ -1,0 +1,33 @@
+[package]
+name = "sniper-cli"
+description = "CLI interface and orchestration for the Solana sniper bot"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sniper"
+path = "src/main.rs"
+
+[dependencies]
+sniper-core = { workspace = true }
+sniper-listener = { workspace = true }
+sniper-decoder = { workspace = true }
+sniper-analyzer = { workspace = true }
+sniper-executor = { workspace = true }
+
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
