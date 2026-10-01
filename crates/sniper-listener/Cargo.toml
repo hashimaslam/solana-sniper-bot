@@ -1,0 +1,32 @@
+[package]
+name = "sniper-listener"
+description = "Geyser gRPC and RPC WebSocket transaction streaming for Solana"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sniper-core = { workspace = true }
+
+solana-sdk = { workspace = true }
+solana-client = { workspace = true }
+solana-transaction-status = { workspace = true }
+
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+tonic = { workspace = true }
+prost = { workspace = true }
+
+tokio-tungstenite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+dashmap = { workspace = true }
+crossbeam-channel = { workspace = true }
