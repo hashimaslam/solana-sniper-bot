@@ -16,6 +16,9 @@ timeout_ms = 30000
 # endpoint = "your-geyser-endpoint:10000"
 # token = "your-auth-token"
 # tls = true
+# Stream commitment: processed is fastest (recommended for sniping)
+# commitment = "processed"
+# connect_timeout_ms = 10000
 
 [wallet]
 # Path to your wallet keypair JSON file
@@ -54,6 +57,30 @@ max_retries = 3
 compute_unit_limit = 200000
 # Simulate transaction before sending
 simulate_first = true
+# Jito tip per bundle in lamports (min 1000). 1_000_000 = 0.001 SOL
+jito_tip_lamports = 1000000
+# Optional Jito auth UUID for higher rate limits
+# jito_auth_uuid = "your-uuid"
+# Race a normal RPC send alongside the bundle
+jito_also_send_rpc = false
+
+[position]
+# Automatically sell opened positions
+enabled = true
+# Take profit at +100% (2x) of cost, measured on sellable value
+take_profit_pct = 100.0
+# Stop loss at -30%
+stop_loss_pct = 30.0
+# Trailing stop: sell if value drops this % from its peak while in profit (0 = off)
+trailing_stop_pct = 0.0
+# Force-sell after this many seconds (0 = off)
+max_hold_secs = 300
+# Re-price open positions every N ms
+poll_interval_ms = 1000
+# Slippage tolerance for sells
+sell_slippage = 0.25
+# Sell retries before giving up
+max_sell_retries = 3
 
 [logging]
 # Log level: trace, debug, info, warn, error
