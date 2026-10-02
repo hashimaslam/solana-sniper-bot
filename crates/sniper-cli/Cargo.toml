@@ -16,6 +16,7 @@ sniper-listener = { workspace = true }
 sniper-decoder = { workspace = true }
 sniper-analyzer = { workspace = true }
 sniper-executor = { workspace = true }
+sniper-position = { workspace = true }
 
 solana-sdk = { workspace = true }
 solana-client = { workspace = true }
