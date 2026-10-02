@@ -143,7 +143,7 @@ mod tests {
             v.extend_from_slice(&x.to_le_bytes());
         }
         v.push(state.complete as u8);
-        v.extend(std::iter::repeat(7u8).take(extra));
+        v.extend(std::iter::repeat_n(7u8, extra));
         v
     }
 

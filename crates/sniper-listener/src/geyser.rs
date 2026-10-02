@@ -96,7 +96,7 @@ pub fn versioned_transaction(tx: &pb::Transaction) -> Result<VersionedTransactio
         .message
         .as_ref()
         .ok_or_else(|| Error::Decode("transaction without message".into()))?;
-    let header = msg.header.clone().unwrap_or_default();
+    let header = msg.header.unwrap_or_default();
     let header = MessageHeader {
         num_required_signatures: u8_index(header.num_required_signatures)?,
         num_readonly_signed_accounts: u8_index(header.num_readonly_signed_accounts)?,

@@ -128,6 +128,40 @@ impl TransactionBuilder {
     }
 }
 
+/// Trait for transaction executors.
+#[async_trait::async_trait]
+pub trait Executor: Send + Sync {
+    /// Execute a buy transaction.
+    async fn execute_buy(
+        &self,
+        pool: &sniper_core::Pool,
+        amount_sol: f64,
+        slippage: f64,
+    ) -> Result<sniper_core::ExecutionResult>;
+
+    /// Sell `token_amount` raw token units back into the pool.
+    async fn execute_sell(
+        &self,
+        pool: &sniper_core::Pool,
+        token_amount: u64,
+        slippage: f64,
+    ) -> Result<sniper_core::ExecutionResult>;
+
+    /// Current on-chain curve state for the pool (used for pricing).
+    async fn curve_state(&self, pool: &sniper_core::Pool) -> Result<sniper_core::BondingCurveState>;
+
+    /// Simulate a transaction before execution.
+    async fn simulate(
+        &self,
+        pool: &sniper_core::Pool,
+        amount_sol: f64,
+        slippage: f64,
+    ) -> Result<()>;
+
+    /// Get the executor name.
+    fn name(&self) -> &'static str;
+}
+
 #[cfg(test)]
 #[allow(deprecated)] // system_instruction is fine for building test fixtures
 mod tests {
@@ -171,38 +205,4 @@ mod tests {
             .unwrap();
         assert_eq!(ix_programs(&tx).len(), 2); // limit + transfer
     }
-}
-
-/// Trait for transaction executors.
-#[async_trait::async_trait]
-pub trait Executor: Send + Sync {
-    /// Execute a buy transaction.
-    async fn execute_buy(
-        &self,
-        pool: &sniper_core::Pool,
-        amount_sol: f64,
-        slippage: f64,
-    ) -> Result<sniper_core::ExecutionResult>;
-
-    /// Sell `token_amount` raw token units back into the pool.
-    async fn execute_sell(
-        &self,
-        pool: &sniper_core::Pool,
-        token_amount: u64,
-        slippage: f64,
-    ) -> Result<sniper_core::ExecutionResult>;
-
-    /// Current on-chain curve state for the pool (used for pricing).
-    async fn curve_state(&self, pool: &sniper_core::Pool) -> Result<sniper_core::BondingCurveState>;
-
-    /// Simulate a transaction before execution.
-    async fn simulate(
-        &self,
-        pool: &sniper_core::Pool,
-        amount_sol: f64,
-        slippage: f64,
-    ) -> Result<()>;
-
-    /// Get the executor name.
-    fn name(&self) -> &'static str;
 }
