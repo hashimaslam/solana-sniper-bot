@@ -24,3 +24,6 @@ anyhow = { workspace = true }
 
 dashmap = { workspace = true }
 spl-token = { workspace = true }
+
+[dev-dependencies]
+chrono = { workspace = true }
