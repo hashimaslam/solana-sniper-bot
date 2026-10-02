@@ -27,7 +27,8 @@ This project is managed with AI assistance. The agent maintains project document
 | `sniper-listener` | Transaction streaming |
 | `sniper-decoder` | Instruction decoding |
 | `sniper-analyzer` | Strategy engine |
-| `sniper-executor` | Transaction execution |
+| `sniper-executor` | Transaction execution (RPC / Jito) |
+| `sniper-position` | Auto-sell position management |
 | `sniper-cli` | CLI interface |
 
 ### Quick Commands

@@ -52,8 +52,10 @@ Foundation crate providing:
 ### sniper-listener
 
 Transaction streaming via:
-- **RPC WebSocket**: Standard `logsSubscribe` with program filters
-- **Geyser gRPC** (future): Direct validator connection for <50ms latency
+- **Geyser gRPC** (`GeyserListener`): Yellowstone `Subscribe` stream filtered on the watched programs (`account_include`, non-vote, non-failed). Each update carries the full transaction, which is turned into a bincode `VersionedTransaction` plus the resolved account keys (static, then ALT writable, then ALT readonly). Sends the `x-token` auth header, replies to server pings, and reconnects with exponential backoff (0.5s to 30s).
+- **RPC WebSocket** (`RpcListener`): `logsSubscribe` fallback. Delivers only the signature, so the decoder fetches the transaction.
+
+The CLI uses Geyser when `[geyser]` is configured. Protos are vendored in `crates/sniper-listener/proto` and compiled by `build.rs`.
 
 The `Listener` trait allows swapping backends:
 
@@ -105,12 +107,14 @@ slippage = 0.15
 ### sniper-executor
 
 Transaction building and submission:
-- Compute budget instructions
-- Priority fees
-- ATA creation
-- Transaction signing
-- Simulation before execution
-- Confirmation polling
+- Buy/sell quotes from live bonding curve reserves (`sniper_core::curve`)
+- Compute budget instructions and priority fees
+- Idempotent ATA creation
+- Simulation before execution (optional), confirmation polling
+- Pluggable `TxSender`:
+  - `RpcSender`: `sendTransaction` with preflight skipped
+  - `JitoSender`: appends a tip transfer to a random Jito tip account, drops the priority fee, submits via `sendBundle`
+  - `RaceSender`: primary sender plus best-effort parallel senders (Jito + RPC)
 
 The `Executor` trait:
 
@@ -123,9 +127,20 @@ pub trait Executor: Send + Sync {
         amount_sol: f64,
         slippage: f64,
     ) -> Result<ExecutionResult>;
+    async fn execute_sell(&self, pool: &Pool, token_amount: u64, slippage: f64) -> Result<ExecutionResult>;
+    async fn curve_state(&self, pool: &Pool) -> Result<BondingCurveState>;
     async fn simulate(&self, pool: &Pool, amount_sol: f64, slippage: f64) -> Result<()>;
 }
 ```
+
+### sniper-position
+
+`PositionManager` tracks filled buys and sells them automatically:
+- Exit rules (`rules.rs`) are pure functions: stop-loss, trailing stop, take-profit, timeout
+- Positions are valued at the full-bag sell quote, so fees and price impact are included
+- Re-prices all positions concurrently every `poll_interval_ms`
+- A `Closing` state prevents double-sells; failed sells are retried, then marked `Failed`
+- Emits `PositionEvent`s (opened / closed / sell failed) for logging or alerts
 
 ### sniper-cli
 
@@ -146,9 +161,11 @@ Orchestrates all components:
 
 ## Future Enhancements
 
-1. **Jito Integration**: MEV-protected bundle submission
-2. **Raydium Support**: V4 and CPMM pool detection
+Done in phase 2: Geyser gRPC listener, Jito bundles, position management.
+
+1. **Raydium / PumpSwap Support**: Detect and sell after curve migration
+2. **Position persistence**: Survive restarts
 3. **Multi-wallet**: Parallel execution across wallets
 4. **Metrics**: Prometheus/Grafana dashboards
-5. **Telegram Alerts**: Real-time notifications
-6. **Position Management**: Auto-sell on profit targets
+5. **Telegram Alerts**: Hook into `PositionEvent`
+6. **Geyser account subscriptions**: Push curve updates instead of polling RPC for position pricing
