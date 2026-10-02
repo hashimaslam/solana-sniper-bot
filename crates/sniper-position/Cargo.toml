@@ -1,6 +1,6 @@
 [package]
-name = "sniper-analyzer"
-description = "Strategy engine and pool analysis for snipe decisions"
+name = "sniper-position"
+description = "Position tracking and automated exits (take-profit, stop-loss, trailing, timeout)"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -8,22 +8,17 @@ license.workspace = true
 
 [dependencies]
 sniper-core = { workspace = true }
+sniper-executor = { workspace = true }
 
 solana-sdk = { workspace = true }
-solana-client = { workspace = true }
-
 tokio = { workspace = true }
-async-trait = { workspace = true }
-
+futures = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
-
 tracing = { workspace = true }
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-
 dashmap = { workspace = true }
-spl-token = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 chrono = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }

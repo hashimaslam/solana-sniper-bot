@@ -9,6 +9,9 @@ use borsh::{BorshDeserialize, BorshSerialize};
 use chrono::Utc;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
+use solana_sdk::transaction::VersionedTransaction;
+use solana_transaction_status::{option_serializer::OptionSerializer, UiTransactionStatusMeta};
+use std::str::FromStr;
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
@@ -28,6 +31,7 @@ mod discriminators {
     pub const SELL: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
 
     /// Withdraw liquidity (migration to Raydium)
+    #[allow(dead_code)]
     pub const WITHDRAW: [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
 }
 
@@ -163,6 +167,53 @@ impl PumpFunDecoder {
         }))
     }
 
+    /// Decode every pump.fun instruction in an already-materialised
+    /// transaction. `account_keys` must be the full resolved key list
+    /// (static keys, then loaded writable, then loaded readonly).
+    ///
+    /// Malformed instructions are skipped, not fatal, so one bad
+    /// instruction can't hide a pool creation in the same transaction.
+    pub fn decode_versioned(
+        &self,
+        vtx: &VersionedTransaction,
+        account_keys: &[Pubkey],
+        signature: solana_sdk::signature::Signature,
+        slot: u64,
+    ) -> Vec<DecodedInstruction> {
+        let mut out = Vec::new();
+        for ix in vtx.message.instructions() {
+            let Some(program_id) = account_keys.get(ix.program_id_index as usize) else {
+                continue;
+            };
+            if *program_id != *programs::PUMP_FUN_PROGRAM || ix.data.len() < 8 {
+                continue;
+            }
+            let Some(accounts) = ix
+                .accounts
+                .iter()
+                .map(|&i| account_keys.get(i as usize).copied())
+                .collect::<Option<Vec<Pubkey>>>()
+            else {
+                debug!("Instruction references unresolved account index");
+                continue;
+            };
+            let discriminator: [u8; 8] = ix.data[..8].try_into().expect("len checked");
+            let decoded = match discriminator {
+                discriminators::CREATE => {
+                    self.parse_create_instruction(&ix.data, &accounts, signature, slot)
+                }
+                discriminators::BUY => self.parse_buy_instruction(&ix.data, &accounts),
+                discriminators::SELL => self.parse_sell_instruction(&ix.data, &accounts),
+                _ => Ok(DecodedInstruction::Unknown),
+            };
+            match decoded {
+                Ok(d) => out.push(d),
+                Err(e) => debug!(error = %e, "Skipping malformed pump.fun instruction"),
+            }
+        }
+        out
+    }
+
     /// Parse buy instruction.
     fn parse_buy_instruction(
         &self,
@@ -257,95 +308,55 @@ impl Decoder for PumpFunDecoder {
     }
 
     async fn decode(&self, tx: &ParsedTransaction) -> Result<Vec<DecodedInstruction>> {
-        let mut instructions = Vec::new();
-
-        // For now, we need to fetch the full transaction to get instruction data
-        // This is because ParsedTransaction only has signature from logs subscription
-        if tx.data.is_empty() {
-            // Fetch full transaction
-            let config = solana_client::rpc_config::RpcTransactionConfig {
-                encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
-                commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
-                max_supported_transaction_version: Some(0),
-            };
-
-            match self
-                .rpc_client
-                .get_transaction_with_config(&tx.signature, config)
-                .await
-            {
-                Ok(tx_data) => {
-                    if let Some(meta) = tx_data.transaction.meta {
-                        if meta.err.is_some() {
-                            return Ok(vec![]);
-                        }
-                    }
-
-                    // Decode the transaction
-                    if let solana_transaction_status::EncodedTransaction::Binary(data, _) =
-                        tx_data.transaction.transaction
-                    {
-                        let decoded = bs58::decode(&data)
-                            .into_vec()
-                            .or_else(|_| base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data))
-                            .map_err(|e| Error::Decode(format!("Failed to decode tx: {}", e)))?;
-
-                        // Parse the versioned transaction
-                        if let Ok(versioned_tx) =
-                            bincode::deserialize::<solana_sdk::transaction::VersionedTransaction>(
-                                &decoded,
-                            )
-                        {
-                            let message = versioned_tx.message;
-                            let account_keys = message.static_account_keys();
-
-                            for instruction in message.instructions() {
-                                let program_id = account_keys[instruction.program_id_index as usize];
-
-                                if program_id != *programs::PUMP_FUN_PROGRAM {
-                                    continue;
-                                }
-
-                                let data = &instruction.data;
-                                if data.len() < 8 {
-                                    continue;
-                                }
-
-                                let discriminator: [u8; 8] = data[..8].try_into().unwrap();
-                                let accounts: Vec<Pubkey> = instruction
-                                    .accounts
-                                    .iter()
-                                    .map(|&i| account_keys[i as usize])
-                                    .collect();
-
-                                let decoded_ix = match discriminator {
-                                    discriminators::CREATE => {
-                                        self.parse_create_instruction(data, &accounts, tx.signature, tx.slot)?
-                                    }
-                                    discriminators::BUY => {
-                                        self.parse_buy_instruction(data, &accounts)?
-                                    }
-                                    discriminators::SELL => {
-                                        self.parse_sell_instruction(data, &accounts)?
-                                    }
-                                    _ => {
-                                        debug!("Unknown pump.fun instruction");
-                                        DecodedInstruction::Unknown
-                                    }
-                                };
-
-                                instructions.push(decoded_ix);
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    warn!(error = %e, "Failed to fetch transaction");
-                }
-            }
+        if !tx.success {
+            return Ok(vec![]);
         }
 
-        Ok(instructions)
+        // Geyser delivers the full transaction; logsSubscribe only gives us
+        // a signature, so fetch it in that case.
+        if !tx.data.is_empty() {
+            let vtx: VersionedTransaction = bincode::deserialize(&tx.data)
+                .map_err(|e| Error::Decode(format!("Failed to deserialize tx: {}", e)))?;
+            let keys = if tx.account_keys.is_empty() {
+                vtx.message.static_account_keys().to_vec()
+            } else {
+                tx.account_keys.clone()
+            };
+            return Ok(self.decode_versioned(&vtx, &keys, tx.signature, tx.slot));
+        }
+
+        let config = solana_client::rpc_config::RpcTransactionConfig {
+            encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
+            commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
+            max_supported_transaction_version: Some(0),
+        };
+        let fetched = match self
+            .rpc_client
+            .get_transaction_with_config(&tx.signature, config)
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch transaction");
+                return Ok(vec![]);
+            }
+        };
+
+        let mut loaded = Vec::new();
+        if let Some(meta) = &fetched.transaction.meta {
+            if meta.err.is_some() {
+                return Ok(vec![]);
+            }
+            loaded = loaded_addresses(meta)?;
+        }
+        let vtx = fetched
+            .transaction
+            .transaction
+            .decode()
+            .ok_or_else(|| Error::Decode("Failed to decode fetched transaction".to_string()))?;
+        let mut keys = vtx.message.static_account_keys().to_vec();
+        keys.extend(loaded);
+        Ok(self.decode_versioned(&vtx, &keys, tx.signature, fetched.slot))
     }
 
     async fn fetch_pool(&self, pool_address: &Pubkey) -> Result<Pool> {
@@ -379,9 +390,168 @@ impl Decoder for PumpFunDecoder {
     }
 }
 
+/// Address-lookup-table keys from RPC metadata, writable first.
+fn loaded_addresses(meta: &UiTransactionStatusMeta) -> Result<Vec<Pubkey>> {
+    match &meta.loaded_addresses {
+        OptionSerializer::Some(la) => la
+            .writable
+            .iter()
+            .chain(la.readonly.iter())
+            .map(|s| Pubkey::from_str(s).map_err(Error::from))
+            .collect(),
+        _ => Ok(vec![]),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn decoder() -> PumpFunDecoder {
+        PumpFunDecoder::new(Arc::new(RpcClient::new("http://127.0.0.1:1".to_string())))
+    }
+
+    fn borsh_string(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u32).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn create_data() -> Vec<u8> {
+        let mut d = discriminators::CREATE.to_vec();
+        borsh_string(&mut d, "Test");
+        borsh_string(&mut d, "TST");
+        borsh_string(&mut d, "https://x");
+        d
+    }
+
+    fn buy_data(amount: u64, max: u64) -> Vec<u8> {
+        let mut d = discriminators::BUY.to_vec();
+        d.extend_from_slice(&amount.to_le_bytes());
+        d.extend_from_slice(&max.to_le_bytes());
+        d
+    }
+
+    fn ix(accounts: Vec<Pubkey>, data: Vec<u8>) -> solana_sdk::instruction::Instruction {
+        solana_sdk::instruction::Instruction {
+            program_id: *programs::PUMP_FUN_PROGRAM,
+            accounts: accounts
+                .into_iter()
+                .map(|k| solana_sdk::instruction::AccountMeta::new(k, false))
+                .collect(),
+            data,
+        }
+    }
+
+    fn tx(ixs: &[solana_sdk::instruction::Instruction]) -> (VersionedTransaction, Vec<Pubkey>) {
+        use solana_sdk::{signature::Keypair, signer::Signer};
+        let kp = Keypair::new();
+        let msg = solana_sdk::message::Message::new(ixs, Some(&kp.pubkey()));
+        let mut t = solana_sdk::transaction::Transaction::new_unsigned(msg);
+        t.sign(&[&kp], solana_sdk::hash::Hash::new_unique());
+        let keys = t.message.account_keys.clone();
+        (t.into(), keys)
+    }
+
+    #[test]
+    fn decodes_create_and_buy_locally() {
+        let accts: Vec<Pubkey> = (0..12).map(|_| Pubkey::new_unique()).collect();
+        let (vtx, keys) = tx(&[ix(accts.clone(), create_data()), ix(accts.clone(), buy_data(5, 9))]);
+        let sig = vtx.signatures[0];
+        let out = decoder().decode_versioned(&vtx, &keys, sig, 77);
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            DecodedInstruction::PoolCreation(ev) => {
+                assert_eq!(ev.pool.token_mint, accts[0]);
+                assert_eq!(ev.pool.bonding_curve, Some(accts[2]));
+                assert_eq!(ev.pool.creator, Some(accts[7]));
+                assert_eq!(ev.slot, 77);
+            }
+            other => panic!("{:?}", other),
+        }
+        assert!(matches!(
+            out[1],
+            DecodedInstruction::Swap { amount_out: 5, amount_in: 9, is_buy: true, .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_instruction_does_not_hide_others() {
+        let accts: Vec<Pubkey> = (0..12).map(|_| Pubkey::new_unique()).collect();
+        let bad = discriminators::CREATE.to_vec(); // no args
+        let (vtx, keys) = tx(&[ix(accts.clone(), bad), ix(accts, create_data())]);
+        let out = decoder().decode_versioned(&vtx, &keys, vtx.signatures[0], 1);
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], DecodedInstruction::PoolCreation(_)));
+    }
+
+    #[test]
+    fn resolves_lookup_table_accounts() {
+        use solana_sdk::message::{v0, MessageHeader, VersionedMessage};
+        use solana_sdk::signature::Keypair;
+        let kp = Keypair::new();
+        let mint = Pubkey::new_unique();
+        let curve = Pubkey::new_unique();
+        let creator = Pubkey::new_unique();
+        // Static: payer(0), program(1). Loaded via ALT: mint(2), curve(3), creator(4).
+        let filler = Pubkey::new_unique();
+        let msg = v0::Message {
+            header: MessageHeader {
+                num_required_signatures: 1,
+                num_readonly_signed_accounts: 0,
+                num_readonly_unsigned_accounts: 1,
+            },
+            account_keys: vec![solana_sdk::signer::Signer::pubkey(&kp), *programs::PUMP_FUN_PROGRAM],
+            recent_blockhash: solana_sdk::hash::Hash::new_unique(),
+            instructions: vec![solana_sdk::instruction::CompiledInstruction {
+                program_id_index: 1,
+                accounts: vec![2, 5, 3, 5, 5, 5, 5, 4],
+                data: create_data(),
+            }],
+            address_table_lookups: vec![v0::MessageAddressTableLookup {
+                account_key: Pubkey::new_unique(),
+                writable_indexes: vec![0, 1, 2],
+                readonly_indexes: vec![3],
+            }],
+        };
+        let vtx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&kp]).unwrap();
+        let mut keys = vtx.message.static_account_keys().to_vec();
+        keys.extend([mint, curve, creator, filler]);
+        let out = decoder().decode_versioned(&vtx, &keys, vtx.signatures[0], 1);
+        match &out[..] {
+            [DecodedInstruction::PoolCreation(ev)] => {
+                assert_eq!(ev.pool.token_mint, mint);
+                assert_eq!(ev.pool.bonding_curve, Some(curve));
+                assert_eq!(ev.pool.creator, Some(creator));
+            }
+            other => panic!("{:?}", other),
+        }
+        // Without the loaded keys the instruction is skipped, not a panic.
+        let static_only = vtx.message.static_account_keys().to_vec();
+        assert!(decoder().decode_versioned(&vtx, &static_only, vtx.signatures[0], 1).is_empty());
+    }
+
+    #[tokio::test]
+    async fn decode_uses_embedded_data_without_rpc() {
+        // RPC points at a dead port: success proves no fetch happened.
+        let accts: Vec<Pubkey> = (0..12).map(|_| Pubkey::new_unique()).collect();
+        let (vtx, keys) = tx(&[ix(accts, create_data())]);
+        let parsed = ParsedTransaction {
+            signature: vtx.signatures[0],
+            slot: 5,
+            block_time: None,
+            data: bincode::serialize(&vtx).unwrap(),
+            account_keys: keys,
+            program_ids: vec![*programs::PUMP_FUN_PROGRAM],
+            success: true,
+        };
+        let out = decoder().decode(&parsed).await.unwrap();
+        assert!(matches!(out[..], [DecodedInstruction::PoolCreation(_)]));
+
+        let mut failed = parsed.clone();
+        failed.success = false;
+        assert!(decoder().decode(&failed).await.unwrap().is_empty());
+    }
 
     #[test]
     fn test_derive_bonding_curve() {

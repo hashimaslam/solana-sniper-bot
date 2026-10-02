@@ -2,7 +2,7 @@
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Signature;
 use std::str::FromStr;
@@ -148,7 +148,7 @@ impl Listener for RpcListener {
                                                             data: vec![],
                                                             account_keys: vec![],
                                                             program_ids: program_ids_extracted,
-                                                            success: true,
+                                                            success: params.result.value.err.is_none(),
                                                         };
 
                                                         if tx
@@ -254,10 +254,3 @@ struct LogsValue {
     logs: Vec<String>,
 }
 
-#[derive(Debug, Serialize)]
-struct SubscribeRequest {
-    jsonrpc: String,
-    id: u64,
-    method: String,
-    params: Vec<serde_json::Value>,
-}

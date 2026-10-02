@@ -4,9 +4,11 @@
 //! This crate provides the foundational building blocks used across all other crates.
 
 pub mod config;
+pub mod curve;
 pub mod error;
 pub mod types;
 
 pub use config::Config;
+pub use curve::BondingCurveState;
 pub use error::{Error, Result};
 pub use types::*;
