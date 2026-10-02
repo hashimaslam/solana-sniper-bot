@@ -39,8 +39,11 @@ borsh = "1.5"
 bs58 = "0.5"
 
 # gRPC for Geyser
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls", "tls-native-roots", "gzip"] }
 prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
 
 # WebSocket
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
