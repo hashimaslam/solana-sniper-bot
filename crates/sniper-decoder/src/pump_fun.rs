@@ -5,7 +5,7 @@
 //! against a virtual liquidity pool until migration to Raydium.
 
 use async_trait::async_trait;
-use borsh::{BorshDeserialize, BorshSerialize};
+use borsh::BorshDeserialize;
 use chrono::Utc;
 use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::pubkey::Pubkey;
@@ -19,61 +19,60 @@ use sniper_core::{programs, Error, ParsedTransaction, Pool, PoolCreationEvent, P
 
 use crate::traits::{DecodedInstruction, Decoder};
 
-/// pump.fun instruction discriminators (first 8 bytes of instruction data).
-mod discriminators {
-    /// Create bonding curve (new token launch)
-    pub const CREATE: [u8; 8] = [0x18, 0x1e, 0xc8, 0x28, 0x05, 0x1c, 0x07, 0x77];
+/// pump.fun instruction discriminators (first 8 bytes of instruction data),
+/// from the current IDL (github.com/pump-fun/pump-public-docs, idl/pump.json).
+pub mod discriminators {
+    /// Legacy create (SPL Token mint + Metaplex metadata)
+    pub const CREATE: [u8; 8] = [24, 30, 200, 40, 5, 28, 7, 119];
+    /// create_v2 (Token-2022 mint); what pump.fun launches use today
+    pub const CREATE_V2: [u8; 8] = [214, 144, 76, 236, 95, 139, 49, 180];
 
-    /// Buy tokens from bonding curve
-    pub const BUY: [u8; 8] = [0x66, 0x06, 0x3d, 0x12, 0x01, 0xda, 0xeb, 0xea];
+    pub const BUY: [u8; 8] = [102, 6, 61, 18, 1, 218, 235, 234];
+    pub const BUY_EXACT_SOL_IN: [u8; 8] = [56, 252, 116, 8, 158, 223, 205, 95];
+    pub const BUY_V2: [u8; 8] = [184, 23, 238, 97, 103, 197, 211, 61];
+    pub const BUY_V3: [u8; 8] = [7, 5, 29, 196, 245, 23, 101, 80];
+    pub const BUY_EXACT_QUOTE_IN_V3: [u8; 8] = [225, 247, 80, 30, 213, 179, 132, 136];
 
-    /// Sell tokens to bonding curve
-    pub const SELL: [u8; 8] = [0x33, 0xe6, 0x85, 0xa4, 0x01, 0x7f, 0x83, 0xad];
-
-    /// Withdraw liquidity (migration to Raydium)
-    #[allow(dead_code)]
-    pub const WITHDRAW: [u8; 8] = [0xb7, 0x12, 0x46, 0x9c, 0x94, 0x6d, 0xa1, 0x22];
+    pub const SELL: [u8; 8] = [51, 230, 133, 164, 1, 127, 131, 173];
+    pub const SELL_V2: [u8; 8] = [93, 246, 130, 60, 231, 233, 64, 178];
+    pub const SELL_V3: [u8; 8] = [28, 146, 222, 119, 38, 196, 105, 213];
 }
 
-/// pump.fun bonding curve account data.
-#[derive(Debug, Clone, BorshDeserialize, BorshSerialize)]
-pub struct BondingCurveData {
-    /// Discriminator (8 bytes)
-    pub discriminator: [u8; 8],
-    /// Virtual token reserves
-    pub virtual_token_reserves: u64,
-    /// Virtual SOL reserves
-    pub virtual_sol_reserves: u64,
-    /// Real token reserves
-    pub real_token_reserves: u64,
-    /// Real SOL reserves
-    pub real_sol_reserves: u64,
-    /// Token total supply
-    pub token_total_supply: u64,
-    /// Whether the curve is complete (migrated)
-    pub complete: bool,
+/// Where `mint` and `bonding_curve` sit in each trade instruction's accounts.
+fn trade_layout(d: [u8; 8]) -> Option<(usize, usize, bool, bool)> {
+    use discriminators::*;
+    // (mint idx, curve idx, is_buy, args are (quote_in, min_tokens_out))
+    Some(match d {
+        BUY => (2, 3, true, false),
+        BUY_EXACT_SOL_IN => (2, 3, true, true),
+        SELL => (2, 3, false, false),
+        BUY_V2 => (1, 10, true, false),
+        SELL_V2 => (1, 10, false, false),
+        BUY_V3 => (1, 5, true, false),
+        BUY_EXACT_QUOTE_IN_V3 => (1, 5, true, true),
+        SELL_V3 => (1, 5, false, false),
+        _ => return None,
+    })
 }
 
-/// Create instruction arguments.
+/// Leading create/create_v2 arguments. Both instructions start with these;
+/// create_v2 appends more (mayhem flag, optional fields) which we read
+/// separately.
 #[derive(Debug, Clone, BorshDeserialize)]
 pub struct CreateArgs {
     pub name: String,
     pub symbol: String,
     pub uri: String,
+    pub creator: Pubkey,
 }
 
-/// Buy instruction arguments.
-#[derive(Debug, Clone, BorshDeserialize)]
-pub struct BuyArgs {
-    pub amount: u64,
-    pub max_sol_cost: u64,
-}
-
-/// Sell instruction arguments.
-#[derive(Debug, Clone, BorshDeserialize)]
-pub struct SellArgs {
-    pub amount: u64,
-    pub min_sol_output: u64,
+/// Borsh-read `T` from the front of `data`, ignoring trailing bytes.
+///
+/// pump.fun keeps appending optional args (`track_volume`, `partial_fill`,
+/// ...), so strict `try_from_slice` breaks every time the IDL grows.
+fn read_prefix<T: BorshDeserialize>(data: &[u8], what: &str) -> Result<T> {
+    let mut slice = data;
+    T::deserialize(&mut slice).map_err(|e| Error::Decode(format!("Failed to parse {}: {}", what, e)))
 }
 
 /// pump.fun decoder implementation.
@@ -100,7 +99,14 @@ impl PumpFunDecoder {
         spl_associated_token_account::get_associated_token_address(bonding_curve, mint)
     }
 
-    /// Parse create instruction.
+    /// Parse `create` / `create_v2`.
+    ///
+    /// Account layouts (current IDL):
+    /// - create:    0 mint, 1 mint_authority, 2 bonding_curve, 3 assoc_bonding_curve,
+    ///   4 global, 5 mpl_token_metadata, 6 metadata, 7 user, 8 system, 9 token_program, ...
+    /// - create_v2: 0 mint, 1 mint_authority, 2 bonding_curve, 3 assoc_bonding_curve,
+    ///   4 global, 5 user, 6 system, 7 token_program (Token-2022), ... 15 program,
+    ///   then optional remaining accounts 16 quote_mint, 17 assoc_quote_curve, 18 quote_token_program.
     fn parse_create_instruction(
         &self,
         data: &[u8],
@@ -108,55 +114,55 @@ impl PumpFunDecoder {
         signature: solana_sdk::signature::Signature,
         slot: u64,
     ) -> Result<DecodedInstruction> {
-        if data.len() < 8 {
-            return Err(Error::Decode("Instruction data too short".to_string()));
-        }
-
-        // Skip discriminator and parse args
-        let args: CreateArgs = BorshDeserialize::try_from_slice(&data[8..])
+        let is_v2 = data.len() >= 8 && data[..8] == discriminators::CREATE_V2;
+        let mut rest = data
+            .get(8..)
+            .ok_or_else(|| Error::Decode("Instruction data too short".to_string()))?;
+        let args = CreateArgs::deserialize(&mut rest)
             .map_err(|e| Error::Decode(format!("Failed to parse create args: {}", e)))?;
 
-        // Account layout for create instruction:
-        // 0: mint
-        // 1: mint authority (PDA)
-        // 2: bonding curve
-        // 3: associated bonding curve (token account)
-        // 4: global state
-        // 5: mpl token metadata
-        // 6: metadata account
-        // 7: user
-        // 8: system program
-        // 9: token program
-        // 10: associated token program
-        // 11: rent
-
-        if accounts.len() < 8 {
-            return Err(Error::Decode("Not enough accounts for create".to_string()));
+        let (min_accounts, token_program_idx) = if is_v2 { (8, 7) } else { (10, 9) };
+        if accounts.len() < min_accounts {
+            return Err(Error::Decode(format!(
+                "Not enough accounts for create: {}",
+                accounts.len()
+            )));
         }
 
         let mint = accounts[0];
         let bonding_curve = accounts[2];
-        let creator = accounts[7];
+        let token_program = accounts[token_program_idx];
+        // create_v2 appends `is_mayhem_mode: bool` right after `creator`.
+        let is_mayhem_mode = is_v2 && rest.first().is_some_and(|b| *b != 0);
+        // A non-WSOL quote mint in remaining account 16 means the coin is not SOL-paired.
+        let quote_mint = match accounts.get(16) {
+            Some(q) if is_v2 && *q != Pubkey::default() => *q,
+            _ => *programs::WSOL_MINT,
+        };
 
         info!(
             mint = %mint,
             name = %args.name,
             symbol = %args.symbol,
-            creator = %creator,
+            creator = %args.creator,
+            v2 = is_v2,
+            mayhem = is_mayhem_mode,
             "Detected pump.fun token creation"
         );
 
         let pool = Pool {
             address: bonding_curve,
             token_mint: mint,
-            quote_mint: *programs::WSOL_MINT,
+            quote_mint,
             pool_type: PoolType::PumpFun,
             initial_liquidity_lamports: 0, // Will be updated from on-chain data
             token_reserve: 0,
             creation_slot: slot,
             created_at: Utc::now(),
-            creator: Some(creator),
+            creator: Some(args.creator),
             bonding_curve: Some(bonding_curve),
+            token_program: Some(token_program),
+            is_mayhem_mode,
         };
 
         Ok(DecodedInstruction::PoolCreation(PoolCreationEvent {
@@ -199,12 +205,13 @@ impl PumpFunDecoder {
             };
             let discriminator: [u8; 8] = ix.data[..8].try_into().expect("len checked");
             let decoded = match discriminator {
-                discriminators::CREATE => {
+                discriminators::CREATE | discriminators::CREATE_V2 => {
                     self.parse_create_instruction(&ix.data, &accounts, signature, slot)
                 }
-                discriminators::BUY => self.parse_buy_instruction(&ix.data, &accounts),
-                discriminators::SELL => self.parse_sell_instruction(&ix.data, &accounts),
-                _ => Ok(DecodedInstruction::Unknown),
+                d => match trade_layout(d) {
+                    Some(layout) => parse_trade(&ix.data, &accounts, layout),
+                    None => Ok(DecodedInstruction::Unknown),
+                },
             };
             match decoded {
                 Ok(d) => out.push(d),
@@ -214,91 +221,35 @@ impl PumpFunDecoder {
         out
     }
 
-    /// Parse buy instruction.
-    fn parse_buy_instruction(
-        &self,
-        data: &[u8],
-        accounts: &[Pubkey],
-    ) -> Result<DecodedInstruction> {
-        if data.len() < 8 + 16 {
-            return Err(Error::Decode("Buy instruction data too short".to_string()));
-        }
+}
 
-        let args: BuyArgs = BorshDeserialize::try_from_slice(&data[8..])
-            .map_err(|e| Error::Decode(format!("Failed to parse buy args: {}", e)))?;
-
-        // Account layout for buy:
-        // 0: global
-        // 1: fee recipient
-        // 2: mint
-        // 3: bonding curve
-        // 4: associated bonding curve
-        // 5: associated user
-        // 6: user
-        // 7: system program
-        // 8: token program
-        // 9: rent
-        // 10: event authority
-        // 11: program
-
-        if accounts.len() < 4 {
-            return Err(Error::Decode("Not enough accounts for buy".to_string()));
-        }
-
-        let mint = accounts[2];
-        let bonding_curve = accounts[3];
-
-        debug!(
-            mint = %mint,
-            amount = args.amount,
-            max_cost = args.max_sol_cost,
-            "Detected pump.fun buy"
-        );
-
-        Ok(DecodedInstruction::Swap {
-            pool: bonding_curve,
-            token_mint: mint,
-            amount_in: args.max_sol_cost,
-            amount_out: args.amount,
-            is_buy: true,
-        })
-    }
-
-    /// Parse sell instruction.
-    fn parse_sell_instruction(
-        &self,
-        data: &[u8],
-        accounts: &[Pubkey],
-    ) -> Result<DecodedInstruction> {
-        if data.len() < 8 + 16 {
-            return Err(Error::Decode("Sell instruction data too short".to_string()));
-        }
-
-        let args: SellArgs = BorshDeserialize::try_from_slice(&data[8..])
-            .map_err(|e| Error::Decode(format!("Failed to parse sell args: {}", e)))?;
-
-        if accounts.len() < 4 {
-            return Err(Error::Decode("Not enough accounts for sell".to_string()));
-        }
-
-        let mint = accounts[2];
-        let bonding_curve = accounts[3];
-
-        debug!(
-            mint = %mint,
-            amount = args.amount,
-            min_output = args.min_sol_output,
-            "Detected pump.fun sell"
-        );
-
-        Ok(DecodedInstruction::Swap {
-            pool: bonding_curve,
-            token_mint: mint,
-            amount_in: args.amount,
-            amount_out: args.min_sol_output,
-            is_buy: false,
-        })
-    }
+/// Parse any buy/sell variant. Every variant's first two args are u64s:
+/// `(amount, max_sol_cost)` for buys, `(amount, min_sol_output)` for sells,
+/// or `(quote_in, min_tokens_out)` for exact-in buys.
+fn parse_trade(
+    data: &[u8],
+    accounts: &[Pubkey],
+    (mint_idx, curve_idx, is_buy, exact_in): (usize, usize, bool, bool),
+) -> Result<DecodedInstruction> {
+    let (a, b): (u64, u64) = read_prefix(&data[8..], "trade args")?;
+    let (mint, pool) = match (accounts.get(mint_idx), accounts.get(curve_idx)) {
+        (Some(m), Some(c)) => (*m, *c),
+        _ => return Err(Error::Decode(format!("Not enough accounts for trade: {}", accounts.len()))),
+    };
+    // Normalise to (amount_in, amount_out) in the direction of the trade.
+    let (amount_in, amount_out) = match (is_buy, exact_in) {
+        (true, false) => (b, a),  // max_sol_cost in, tokens out
+        (true, true) => (a, b),   // quote in, min tokens out
+        (false, _) => (a, b),     // tokens in, min sol out
+    };
+    debug!(mint = %mint, is_buy, amount_in, amount_out, "Detected pump.fun trade");
+    Ok(DecodedInstruction::Swap {
+        pool,
+        token_mint: mint,
+        amount_in,
+        amount_out,
+        is_buy,
+    })
 }
 
 #[async_trait]
@@ -315,8 +266,7 @@ impl Decoder for PumpFunDecoder {
         // Geyser delivers the full transaction; logsSubscribe only gives us
         // a signature, so fetch it in that case.
         if !tx.data.is_empty() {
-            let vtx: VersionedTransaction = bincode::deserialize(&tx.data)
-                .map_err(|e| Error::Decode(format!("Failed to deserialize tx: {}", e)))?;
+            let vtx = sniper_core::txv1::deserialize_any(&tx.data)?;
             let keys = if tx.account_keys.is_empty() {
                 vtx.message.static_account_keys().to_vec()
             } else {
@@ -328,7 +278,8 @@ impl Decoder for PumpFunDecoder {
         let config = solana_client::rpc_config::RpcTransactionConfig {
             encoding: Some(solana_transaction_status::UiTransactionEncoding::Base64),
             commitment: Some(solana_sdk::commitment_config::CommitmentConfig::confirmed()),
-            max_supported_transaction_version: Some(0),
+            // 1 = accept SIMD-0385 v1 transactions, which pump.fun launches use.
+            max_supported_transaction_version: Some(1),
         };
         let fetched = match self
             .rpc_client
@@ -349,11 +300,16 @@ impl Decoder for PumpFunDecoder {
             }
             loaded = loaded_addresses(meta)?;
         }
-        let vtx = fetched
-            .transaction
-            .transaction
-            .decode()
-            .ok_or_else(|| Error::Decode("Failed to decode fetched transaction".to_string()))?;
+        let vtx = match &fetched.transaction.transaction {
+            solana_transaction_status::EncodedTransaction::Binary(b64, _) => {
+                let raw = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, b64)
+                    .map_err(|e| Error::Decode(format!("bad base64 tx: {}", e)))?;
+                sniper_core::txv1::deserialize_any(&raw)?
+            }
+            other => other
+                .decode()
+                .ok_or_else(|| Error::Decode("Failed to decode fetched transaction".to_string()))?,
+        };
         let mut keys = vtx.message.static_account_keys().to_vec();
         keys.extend(loaded);
         Ok(self.decode_versioned(&vtx, &keys, tx.signature, fetched.slot))
@@ -366,8 +322,7 @@ impl Decoder for PumpFunDecoder {
             .await
             .map_err(|e| Error::Rpc(format!("Failed to fetch bonding curve: {}", e)))?;
 
-        let curve_data: BondingCurveData = BorshDeserialize::try_from_slice(&account.data)
-            .map_err(|e| Error::Decode(format!("Failed to parse bonding curve: {}", e)))?;
+        let curve_data = sniper_core::BondingCurveState::from_account_data(&account.data)?;
 
         // Derive mint from PDA (reverse lookup - need to iterate or cache)
         // For now, return a partial pool
@@ -382,6 +337,8 @@ impl Decoder for PumpFunDecoder {
             created_at: Utc::now(),
             creator: None,
             bonding_curve: Some(*pool_address),
+            token_program: None,
+            is_mayhem_mode: false,
         })
     }
 
@@ -417,11 +374,14 @@ mod tests {
         out.extend_from_slice(s.as_bytes());
     }
 
+    const CREATOR: Pubkey = Pubkey::new_from_array([7; 32]);
+
     fn create_data() -> Vec<u8> {
         let mut d = discriminators::CREATE.to_vec();
         borsh_string(&mut d, "Test");
         borsh_string(&mut d, "TST");
         borsh_string(&mut d, "https://x");
+        d.extend_from_slice(CREATOR.as_ref());
         d
     }
 
@@ -429,6 +389,7 @@ mod tests {
         let mut d = discriminators::BUY.to_vec();
         d.extend_from_slice(&amount.to_le_bytes());
         d.extend_from_slice(&max.to_le_bytes());
+        d.push(1); // trailing track_volume OptionBool, as mainnet sends
         d
     }
 
@@ -464,7 +425,9 @@ mod tests {
             DecodedInstruction::PoolCreation(ev) => {
                 assert_eq!(ev.pool.token_mint, accts[0]);
                 assert_eq!(ev.pool.bonding_curve, Some(accts[2]));
-                assert_eq!(ev.pool.creator, Some(accts[7]));
+                // Creator comes from the instruction args, not the payer.
+                assert_eq!(ev.pool.creator, Some(CREATOR));
+                assert_eq!(ev.pool.token_program, Some(accts[9]));
                 assert_eq!(ev.slot, 77);
             }
             other => panic!("{:?}", other),
@@ -505,7 +468,7 @@ mod tests {
             recent_blockhash: solana_sdk::hash::Hash::new_unique(),
             instructions: vec![solana_sdk::instruction::CompiledInstruction {
                 program_id_index: 1,
-                accounts: vec![2, 5, 3, 5, 5, 5, 5, 4],
+                accounts: vec![2, 5, 3, 5, 5, 5, 5, 4, 5, 5],
                 data: create_data(),
             }],
             address_table_lookups: vec![v0::MessageAddressTableLookup {
@@ -522,7 +485,8 @@ mod tests {
             [DecodedInstruction::PoolCreation(ev)] => {
                 assert_eq!(ev.pool.token_mint, mint);
                 assert_eq!(ev.pool.bonding_curve, Some(curve));
-                assert_eq!(ev.pool.creator, Some(creator));
+                assert_eq!(ev.pool.creator, Some(CREATOR));
+                let _ = creator;
             }
             other => panic!("{:?}", other),
         }
@@ -551,6 +515,68 @@ mod tests {
         let mut failed = parsed.clone();
         failed.success = false;
         assert!(decoder().decode(&failed).await.unwrap().is_empty());
+    }
+
+    /// Real mainnet launch (v1 tx: create_v2 + buy_v2), captured 2026-10-02.
+    #[tokio::test]
+    async fn decodes_real_mainnet_create_v2_launch() {
+        use base64::Engine;
+        use std::str::FromStr;
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(include_str!("../../sniper-core/tests/fixtures/create_v2_tx_v1.b64").trim())
+            .unwrap();
+        let vtx = sniper_core::txv1::deserialize_any(&raw).unwrap();
+        let parsed = ParsedTransaction {
+            signature: vtx.signatures[0],
+            slot: 1,
+            block_time: None,
+            data: raw,
+            account_keys: vec![], // v1 has no lookup tables; static keys suffice
+            program_ids: vec![],
+            success: true,
+        };
+        let out = decoder().decode(&parsed).await.unwrap();
+        let pk = |s: &str| Pubkey::from_str(s).unwrap();
+        match &out[..] {
+            [DecodedInstruction::PoolCreation(ev), DecodedInstruction::Swap { is_buy: true, token_mint, pool, .. }] => {
+                let mint = pk("BpDR9CZtZKYMu1a9L8yBfdXVJx9NcbZjkaVYSRq8pump");
+                let curve = pk("FjzSWshoB8msrGDpYnREYKYSpxoreQXTy5WvSCu8wq84");
+                assert_eq!(ev.pool.token_mint, mint);
+                assert_eq!(ev.pool.bonding_curve, Some(curve));
+                assert_eq!(ev.pool.bonding_curve.unwrap(), PumpFunDecoder::derive_bonding_curve(&mint).0);
+                assert_eq!(ev.pool.creator, Some(pk("FhTPy8WsprLrbetyEAUJYYaXfChrKa2GGNxygorBMNC")));
+                assert_eq!(ev.pool.token_program, Some(*programs::TOKEN_2022_PROGRAM));
+                assert_eq!(ev.pool.quote_mint, *programs::WSOL_MINT);
+                assert!(!ev.pool.is_mayhem_mode);
+                // The dev buy in the same tx decodes against the same curve.
+                assert_eq!(*token_mint, mint);
+                assert_eq!(*pool, curve);
+            }
+            other => panic!("unexpected {:?}", other),
+        }
+    }
+
+    #[test]
+    fn decodes_v3_trade_layouts() {
+        let accts: Vec<Pubkey> = (0..17).map(|_| Pubkey::new_unique()).collect();
+        let mut sell = discriminators::SELL_V3.to_vec();
+        sell.extend_from_slice(&500u64.to_le_bytes());
+        sell.extend_from_slice(&9u64.to_le_bytes());
+        let mut exact = discriminators::BUY_EXACT_QUOTE_IN_V3.to_vec();
+        exact.extend_from_slice(&1_000u64.to_le_bytes());
+        exact.extend_from_slice(&42u64.to_le_bytes());
+        exact.push(1);
+        exact.push(0);
+        let (vtx, keys) = tx(&[ix(accts.clone(), sell), ix(accts.clone(), exact)]);
+        let out = decoder().decode_versioned(&vtx, &keys, vtx.signatures[0], 1);
+        match &out[..] {
+            [DecodedInstruction::Swap { is_buy: false, amount_in: 500, amount_out: 9, token_mint: m1, pool: c1 },
+             DecodedInstruction::Swap { is_buy: true, amount_in: 1_000, amount_out: 42, .. }] => {
+                assert_eq!(*m1, accts[1]);
+                assert_eq!(*c1, accts[5]);
+            }
+            other => panic!("{:?}", other),
+        }
     }
 
     #[test]
