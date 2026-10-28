@@ -27,3 +27,4 @@ spl-token = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+base64 = { workspace = true }

@@ -1,133 +1,122 @@
 # pump.fun Protocol
 
+Reference for how this bot talks to pump.fun. Source of truth: the official IDL and docs at
+<https://github.com/pump-fun/pump-public-docs> (`idl/pump.json`, `docs/instructions/*`).
+Everything below was also checked against mainnet on 2026-10-02 (see the referenced transactions and tests).
+
 ## Overview
 
-pump.fun is a token launchpad on Solana that uses bonding curves for price discovery. Tokens are created with a fixed supply and traded against a virtual AMM until reaching a market cap threshold, at which point liquidity migrates to Raydium.
+pump.fun launches tokens on a constant-product bonding curve over virtual reserves. When the curve's real token reserves run out, the curve is `complete` and liquidity migrates to **PumpSwap** (pump.fun's own AMM), not Raydium.
 
-## Program ID
+## Program IDs
 
-```
-6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P
-```
+| Program | Address |
+|---|---|
+| pump | `6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P` |
+| Pump Fees | `pfeeUxB6jkeY1Hxd7CsFCAjcbHA9rWtchMGdZ6VojVZ` |
 
-## Instruction Discriminators
+## Instructions the bot uses
 
-| Instruction | Discriminator (hex) | Description |
-|-------------|---------------------|-------------|
-| Create | `181ec828051c0777` | Create new bonding curve |
-| Buy | `66063d1201daebea` | Buy tokens from curve |
-| Sell | `33e685a4017f83ad` | Sell tokens to curve |
-| Withdraw | `b712469c946da122` | Migrate to Raydium |
+| Instruction | Discriminator | Used for |
+|---|---|---|
+| `create` | `[24,30,200,40,5,28,7,119]` | Detect (legacy SPL Token launches) |
+| `create_v2` | `[214,144,76,236,95,139,49,180]` | Detect (Token-2022 launches, all new coins) |
+| `buy_exact_quote_in_v3` | `[225,247,80,30,213,179,132,136]` | **Our buys**: spend exact SOL, require min tokens |
+| `sell_v3` | `[28,146,222,119,38,196,105,213]` | **Our sells** |
 
-## Account Layout
+The decoder also recognises `buy`, `sell`, `buy_exact_sol_in`, `buy_v2`, `sell_v2` and `buy_v3` from other traders.
 
-### Create Instruction
+### Why v3
 
-| Index | Account | Writable | Signer | Description |
-|-------|---------|----------|--------|-------------|
-| 0 | Mint | ✓ | ✗ | Token mint |
-| 1 | Mint Authority | ✗ | ✗ | PDA |
-| 2 | Bonding Curve | ✓ | ✗ | Bonding curve PDA |
-| 3 | Associated Bonding Curve | ✓ | ✗ | Token account for curve |
-| 4 | Global | ✗ | ✗ | Global state PDA |
-| 5 | MPL Token Metadata | ✗ | ✗ | Metaplex program |
-| 6 | Metadata | ✓ | ✗ | Token metadata account |
-| 7 | User | ✓ | ✓ | Creator wallet |
-| 8 | System Program | ✗ | ✗ | |
-| 9 | Token Program | ✗ | ✗ | |
-| 10 | ATA Program | ✗ | ✗ | |
-| 11 | Rent | ✗ | ✗ | |
+`buy_v3` / `buy_exact_quote_in_v3` / `sell_v3` take 17 accounts instead of 26–27. They charge the same prices and fees; the protocol and creator fees just stay on the curve until swept. They fail with `CashbackCoinNotSupported` (6094) on cashback coins, so the executor skips those.
 
-### Buy Instruction
+### v3 accounts (SOL-paired coin)
 
-| Index | Account | Writable | Signer | Description |
-|-------|---------|----------|--------|-------------|
-| 0 | Global | ✗ | ✗ | Global state |
-| 1 | Fee Recipient | ✓ | ✗ | pump.fun treasury |
-| 2 | Mint | ✗ | ✗ | Token mint |
-| 3 | Bonding Curve | ✓ | ✗ | Bonding curve PDA |
-| 4 | Associated Bonding Curve | ✓ | ✗ | Curve's token account |
-| 5 | Associated User | ✓ | ✗ | User's token account |
-| 6 | User | ✓ | ✓ | Buyer wallet |
-| 7 | System Program | ✗ | ✗ | |
-| 8 | Token Program | ✗ | ✗ | |
-| 9 | Rent | ✗ | ✗ | |
-| 10 | Event Authority | ✗ | ✗ | PDA for events |
-| 11 | Program | ✗ | ✗ | pump.fun program |
+| # | Account | W | S | Derivation |
+|---|---|---|---|---|
+| 0 | global | | | PDA `["global"]` = `4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5SKy2uB4Jjaxnjf` |
+| 1 | base_mint | | | coin mint |
+| 2 | quote_mint | | | WSOL `So111…112` |
+| 3 | base_token_program | | | mint owner: Token-2022 for `create_v2` coins, SPL Token for older ones |
+| 4 | quote_token_program | | | SPL Token |
+| 5 | bonding_curve | ✓ | | PDA `["bonding-curve", mint]` |
+| 6 | associated_base_bonding_curve | ✓ | | ATA(curve, mint, base_token_program) |
+| 7 | associated_quote_bonding_curve | ✓ | | ATA(curve, WSOL, SPL Token); unused for SOL coins but must be the derived address |
+| 8 | user | ✓ | ✓ | trader |
+| 9 | associated_base_user | ✓ | | ATA(user, mint, base_token_program). **Must exist**: the bot creates it idempotently before buying |
+| 10 | associated_quote_user | ✓ | | ATA(user, WSOL, SPL Token); unused for SOL coins |
+| 11 | user_volume_accumulator | ✓ | | PDA `["user_volume_accumulator", user]`, created on first trade (~0.0018 SOL) |
+| 12 | fee_config | | | Pump Fees PDA `["fee_config", pump_program_id]` = `8Wf5TiAheLUqBrKXeYg2JtAFFMWtKdG2BSFgqUcPVwTt` |
+| 13 | buyback_fee_recipient | ✓ | | one of 8 buyback wallets (picked at random) |
+| 14 | system_program | | | |
+| 15 | event_authority | | | PDA `["__event_authority"]` |
+| 16 | program | | | pump |
 
-## PDA Derivation
+Verified by `matches_mainnet_sell_v3_accounts` against mainnet tx `2eyyahVtB6SP8dLgjvmePYXo5H9xCgmW2DamMJ4Lo73uf3QMRtuLGmjd4sZnzgWp9PXyMZ7QgDA8o43WTw9yF4LW`.
 
-### Bonding Curve
+### Instruction data
 
-```rust
-Pubkey::find_program_address(
-    &[b"bonding-curve", mint.as_ref()],
-    &PUMP_FUN_PROGRAM
-)
-```
+- `buy_exact_quote_in_v3`: `disc | spendable_quote_in: u64 | min_tokens_out: u64 | partial_fill: OptionBool` (we send `[1, 0]` = Some(false))
+- `sell_v3`: `disc | amount: u64 | min_sol_output: u64`
 
-### Global State
+pump.fun keeps appending optional trailing arguments, so the decoder reads arguments as a prefix and ignores trailing bytes.
 
-```rust
-Pubkey::find_program_address(
-    &[b"global"],
-    &PUMP_FUN_PROGRAM
-)
-```
+### create / create_v2 accounts used for detection
 
-### Event Authority
+| | mint | bonding_curve | token_program | creator |
+|---|---|---|---|---|
+| `create` | 0 | 2 | 9 | arg |
+| `create_v2` | 0 | 2 | 7 | arg |
 
-```rust
-Pubkey::find_program_address(
-    &[b"__event_authority"],
-    &PUMP_FUN_PROGRAM
-)
-```
+Both start with `name, symbol, uri: String, creator: Pubkey`. `create_v2` follows with `is_mayhem_mode: bool`. Optional remaining accounts 16–18 on `create_v2` set a non-SOL quote mint.
 
-## Bonding Curve Data
+## Bonding curve account
 
-```rust
-struct BondingCurveData {
-    discriminator: [u8; 8],
-    virtual_token_reserves: u64,
-    virtual_sol_reserves: u64,
-    real_token_reserves: u64,
-    real_sol_reserves: u64,
-    token_total_supply: u64,
-    complete: bool,
-}
-```
+166 bytes today (older accounts are shorter; missing fields read as zero):
 
-## Price Calculation
+| Offset | Field | Type |
+|---|---|---|
+| 0 | discriminator | `[u8; 8]` |
+| 8 | virtual_token_reserves | u64 |
+| 16 | virtual_quote_reserves | u64 |
+| 24 | real_token_reserves | u64 |
+| 32 | real_quote_reserves | u64 |
+| 40 | token_total_supply | u64 |
+| 48 | complete | bool |
+| 49 | creator | Pubkey |
+| 81 | is_mayhem_mode | bool |
+| 82 | is_cashback_coin | bool |
+| 83 | quote_mint | Pubkey (all-zero = SOL) |
+| 115.. | creator_fee_bps, fee accumulators, depth, … | (not read) |
 
-The bonding curve uses constant product formula:
+Launch reserves: 30 SOL virtual, 1.073B virtual tokens, 793.1M real tokens, 1B supply (6 decimals).
+
+## Pricing and fees
+
+Constant product over virtual reserves:
 
 ```
-token_out = (virtual_token_reserves * sol_in) / (virtual_sol_reserves + sol_in)
+tokens_out = vtr * sol_net / (vsr + sol_net)        sol_net = sol_in / (1 + fee)
+sol_out    = vsr * tokens_in / (vtr + tokens_in) * (1 - fee)
 ```
 
-Initial state:
-- Virtual SOL reserves: ~30 SOL
-- Virtual token reserves: 1B tokens
-- Real reserves: 0
+Fees come from the Pump Fees `fee_config` account, tiered by market cap. Currently there is a **single tier: 95 bps protocol + 30 bps creator = 1.25%**. Confirmed against mainnet `TradeEvent`s (`fee_basis_points = 95`, `creator_fee_basis_points = 30`). Half of the protocol fee goes to the buyback recipient.
 
-## Fee Structure
+## Transaction format
 
-- 1% fee on all trades
-- Fee recipient: `CebN5WGQ4jvEPvsVU4EoHEpgzq1VV7AbicfhtW4xC9iM`
+pump.fun launches are often sent as **SIMD-0385 v1 transactions** (version byte `129`), which `solana-sdk` 2.x can't deserialize. `sniper_core::txv1` parses them, and RPC fetches request `maxSupportedTransactionVersion: 1`.
 
-## Migration
+## Mainnet simulation
 
-When bonding curve reaches ~$69k market cap (~85 SOL raised):
-- `complete` flag set to true
-- Liquidity migrates to Raydium
-- LP tokens burned (locked forever)
+`cargo run -p sniper-executor --example simulate_mainnet -- <MINT> <WALLET> [FEE_PAYER]` builds our buy and sell for a live curve and runs `simulateTransaction` (no signing, nothing sent). On 2026-10-02:
 
-## Snipe Strategy
+- Coin `BFBv71Hsgd4Zp5kAVzVExyrRQqqXvWK4rPTwWvLopump` (Token-2022), as holder `GPnucVh9QnWGHyNBS1uFFJhRKVMXJGignRySoWrihokP`: **both `buy_exact_quote_in_v3` (60.6k CU) and `sell_v3` (56.6k CU) succeeded**.
+- The simulated sell's `TradeEvent` gave a net of 42,624 lamports; our curve model predicted 42,626 (the program rounds protocol and creator fees separately).
 
-1. **Detection**: Subscribe to pump.fun program logs
-2. **Filter**: Look for `Create` instruction discriminator
-3. **Extract**: Parse mint, bonding curve, creator from accounts
-4. **Analyze**: Check creator history, metadata, token authorities
-5. **Execute**: Build and send `Buy` instruction immediately
-6. **Timing**: First few seconds critical for best entry
+## Snipe flow
+
+1. **Detect** `create` / `create_v2` (Geyser, or `logsSubscribe` + fetch)
+2. **Extract** mint, curve, creator, token program, mayhem flag
+3. **Analyze**: token authorities (SPL Token or Token-2022), age, blacklist
+4. **Buy** with `buy_exact_quote_in_v3`, after an idempotent ATA create
+5. **Manage**: re-price from the curve, exit with `sell_v3`

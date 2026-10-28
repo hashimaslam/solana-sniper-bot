@@ -6,6 +6,7 @@
 pub mod config;
 pub mod curve;
 pub mod error;
+pub mod txv1;
 pub mod types;
 
 pub use config::Config;

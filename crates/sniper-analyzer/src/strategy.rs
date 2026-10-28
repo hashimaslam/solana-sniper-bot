@@ -11,7 +11,8 @@ use std::sync::Arc;
 use tracing::{debug, info, warn};
 
 use sniper_core::{
-    config::StrategyConfig, AnalysisResult, Pool, PoolType, Result, RiskFactor, RiskType,
+    config::StrategyConfig, programs, AnalysisResult, Pool, PoolType, Result, RiskFactor,
+    RiskType,
 };
 
 /// Strategy analyzer for evaluating pools.
@@ -220,12 +221,16 @@ impl StrategyAnalyzer {
         // Fetch mint account
         match self.rpc_client.get_account(mint).await {
             Ok(account) => {
-                // Check if it's a valid SPL token
-                if account.owner != spl_token::id() {
+                // Must be an SPL Token or Token-2022 mint. pump.fun create_v2
+                // coins (every launch today) are Token-2022. The base mint
+                // layout (first 82 bytes) is identical for both programs.
+                if account.owner != *programs::TOKEN_PROGRAM
+                    && account.owner != *programs::TOKEN_2022_PROGRAM
+                {
                     risks.push(RiskFactor {
                         risk_type: RiskType::SuspiciousMetadata,
                         severity: 1.0,
-                        description: "Not owned by SPL Token program".to_string(),
+                        description: format!("Mint owned by unexpected program {}", account.owner),
                     });
                     return Ok(risks);
                 }
@@ -313,6 +318,67 @@ mod tests {
             blacklist: vec![],
             creator_whitelist: vec![],
         }
+    }
+
+    /// Mock RPC returning `owner` for any getAccountInfo, with a mint whose
+    /// mint and freeze authorities are revoked.
+    fn rpc_with_mint(owner: &Pubkey) -> Arc<RpcClient> {
+        use base64::Engine;
+        use solana_client::rpc_request::RpcRequest;
+        let mut data = vec![0u8; 82];
+        data[36..44].copy_from_slice(&1_000_000_000_000_000u64.to_le_bytes());
+        data[44] = 6;
+        data[45] = 1;
+        let mocks = [(
+            RpcRequest::GetAccountInfo,
+            serde_json::json!({
+                "context": {"slot": 1},
+                "value": {
+                    "data": [base64::engine::general_purpose::STANDARD.encode(&data), "base64"],
+                    "executable": false,
+                    "lamports": 1_461_600,
+                    "owner": owner.to_string(),
+                    "rentEpoch": 0,
+                    "space": 82
+                }
+            }),
+        )]
+        .into_iter()
+        .collect();
+        Arc::new(RpcClient::new_mock_with_mocks("succeeds".to_string(), mocks))
+    }
+
+    fn pool() -> Pool {
+        Pool {
+            address: Pubkey::new_unique(),
+            token_mint: Pubkey::new_unique(),
+            quote_mint: *programs::WSOL_MINT,
+            pool_type: PoolType::PumpFun,
+            initial_liquidity_lamports: 2_000_000_000,
+            token_reserve: 0,
+            creation_slot: 0,
+            created_at: chrono::Utc::now(),
+            creator: None,
+            bonding_curve: None,
+            token_program: None,
+            is_mayhem_mode: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_token_2022_mints() {
+        let a = StrategyAnalyzer::new(mock_config(), rpc_with_mint(&programs::TOKEN_2022_PROGRAM));
+        let r = a.analyze(&pool()).await.unwrap();
+        assert!(r.should_snipe, "{:?}", r);
+        assert!(r.risk_factors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_unknown_mint_owner() {
+        let a = StrategyAnalyzer::new(mock_config(), rpc_with_mint(&Pubkey::new_unique()));
+        let r = a.analyze(&pool()).await.unwrap();
+        assert!(!r.should_snipe);
+        assert_eq!(r.risk_factors[0].risk_type, RiskType::SuspiciousMetadata);
     }
 
     #[test]

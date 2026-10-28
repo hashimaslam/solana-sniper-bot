@@ -110,6 +110,8 @@ fn pool() -> Pool {
         created_at: Utc::now(),
         creator: None,
         bonding_curve: Some(curve),
+        token_program: None,
+        is_mayhem_mode: false,
     }
 }
 

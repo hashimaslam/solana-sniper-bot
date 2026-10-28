@@ -38,12 +38,26 @@ pub struct Pool {
 
     /// Associated bonding curve (for pump.fun)
     pub bonding_curve: Option<Pubkey>,
+
+    /// Token program owning `token_mint`. `None` means legacy SPL Token;
+    /// pump.fun `create_v2` coins use Token-2022.
+    #[serde(default)]
+    pub token_program: Option<Pubkey>,
+
+    /// pump.fun mayhem mode coin (non-standard reserves and fees).
+    #[serde(default)]
+    pub is_mayhem_mode: bool,
 }
 
 impl Pool {
     /// Get initial liquidity in SOL.
     pub fn liquidity_sol(&self) -> f64 {
         self.initial_liquidity_lamports as f64 / 1_000_000_000.0
+    }
+
+    /// Token program for `token_mint` (defaults to legacy SPL Token).
+    pub fn token_program(&self) -> Pubkey {
+        self.token_program.unwrap_or(*programs::TOKEN_PROGRAM)
     }
 
     /// Get pool age in seconds.
