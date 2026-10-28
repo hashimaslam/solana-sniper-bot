@@ -90,6 +90,16 @@ Every tick (`position.poll_interval_ms`), each open position is re-priced as *wh
 
 Failed sells are retried up to `max_sell_retries` times. If the bonding curve completes (the token migrates), the position is flagged for manual handling. Open positions are **not** sold on shutdown.
 
+## Checking against mainnet (read-only)
+
+```bash
+# Simulate a buy and sell of <MINT> as <WALLET>; nothing is signed or sent.
+# FEE_PAYER (optional) is any SOL-funded address, so WALLET can be a holder with no SOL.
+cargo run -p sniper-executor --example simulate_mainnet -- <MINT> <WALLET> [FEE_PAYER] [RPC_URL]
+```
+
+A correct account layout gets past Anchor's account validation; a wrong one fails with an account error such as 2006 (ConstraintSeeds) or 3012 (AccountNotInitialized).
+
 ## Safety
 
 ⚠️ **This is experimental software for educational purposes.**
@@ -97,7 +107,8 @@ Failed sells are retried up to `max_sell_retries` times. If the bonding curve co
 - Never use with funds you cannot afford to lose
 - Always test on devnet first
 - Sniping carries high risk of rug pulls and failed trades
-- pump.fun has added instruction accounts over time (creator vault, volume accumulators). Check the buy/sell account layouts in `sniper-executor/src/pump_fun.rs` against the current IDL before trading real funds
+- Trades use pump.fun's v3 instructions (`buy_exact_quote_in_v3`, `sell_v3`), checked against the official IDL and a real mainnet `sell_v3`, and simulated on mainnet (see below). Only SOL-paired, non-cashback coins are traded; others are skipped
+- Fees are taken as 1.25% (0.95% protocol + 0.30% creator, the current single tier). If pump.fun adds market-cap tiers, quotes drift until `DEFAULT_FEE_BPS` is updated
 - Positions are held in memory only: if the process restarts, open positions stop being managed
 
 ## License
