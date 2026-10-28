@@ -10,11 +10,12 @@ use crate::error::{Error, Result};
 /// Basis-point denominator.
 pub const BPS_DENOMINATOR: u64 = 10_000;
 
-/// Default pump.fun trade fee in basis points (1%).
+/// pump.fun trade fee in basis points: protocol 95 + creator 30.
 ///
-/// pump.fun has moved to tiered fees; treat this as an estimate and keep
-/// slippage tolerance wide enough to absorb the difference.
-pub const DEFAULT_FEE_BPS: u64 = 100;
+/// Read from the live Pump Fees `fee_config` account (single tier) and
+/// confirmed against mainnet `TradeEvent`s. Fees are tiered by market cap in
+/// principle, so keep slippage wide enough to absorb a tier change.
+pub const DEFAULT_FEE_BPS: u64 = 125;
 
 /// Virtual token reserves of a freshly created pump.fun curve (6 decimals).
 pub const INITIAL_VIRTUAL_TOKEN_RESERVES: u64 = 1_073_000_000_000_000;
@@ -29,6 +30,12 @@ pub const INITIAL_REAL_TOKEN_RESERVES: u64 = 793_100_000_000_000;
 /// (8 discriminator + 5 * u64 + bool).
 pub const BONDING_CURVE_MIN_LEN: usize = 8 + 5 * 8 + 1;
 
+/// Offsets of the fields appended after `complete` in the current layout.
+const CREATOR_OFFSET: usize = BONDING_CURVE_MIN_LEN; // 49
+const MAYHEM_OFFSET: usize = CREATOR_OFFSET + 32; // 81
+const CASHBACK_OFFSET: usize = MAYHEM_OFFSET + 1; // 82
+const QUOTE_MINT_OFFSET: usize = CASHBACK_OFFSET + 1; // 83
+
 /// Snapshot of a pump.fun bonding curve account.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BondingCurveState {
@@ -39,6 +46,14 @@ pub struct BondingCurveState {
     pub token_total_supply: u64,
     /// `true` once the curve has completed and liquidity migrated.
     pub complete: bool,
+    /// Coin creator (zero on very old accounts).
+    pub creator: [u8; 32],
+    /// Mayhem mode coin (different fees, no synthetic migration).
+    pub is_mayhem_mode: bool,
+    /// Cashback coin (v3 trades are rejected for these).
+    pub is_cashback_coin: bool,
+    /// Quote mint; all-zero means SOL.
+    pub quote_mint: [u8; 32],
 }
 
 impl BondingCurveState {
@@ -52,13 +67,22 @@ impl BondingCurveState {
             real_sol_reserves: 0,
             token_total_supply: 1_000_000_000_000_000,
             complete: false,
+            creator: [0; 32],
+            is_mayhem_mode: false,
+            is_cashback_coin: false,
+            quote_mint: [0; 32],
         }
+    }
+
+    /// `true` if the curve is priced in SOL (the only quote we trade).
+    pub fn is_sol_quoted(&self) -> bool {
+        self.quote_mint == [0; 32]
     }
 
     /// Parse raw account data.
     ///
-    /// Reads fixed offsets and ignores trailing bytes, because newer versions
-    /// of the account append fields (e.g. `creator`) after `complete`.
+    /// Reads fixed offsets. Fields appended after `complete` are read when
+    /// present and default to zero/false on older, shorter accounts.
     pub fn from_account_data(data: &[u8]) -> Result<Self> {
         if data.len() < BONDING_CURVE_MIN_LEN {
             return Err(Error::Decode(format!(
@@ -70,6 +94,12 @@ impl BondingCurveState {
             let off = 8 + i * 8;
             u64::from_le_bytes(data[off..off + 8].try_into().expect("slice is 8 bytes"))
         };
+        let bytes32 = |off: usize| -> [u8; 32] {
+            data.get(off..off + 32)
+                .map(|s| s.try_into().expect("slice is 32 bytes"))
+                .unwrap_or([0; 32])
+        };
+        let flag = |off: usize| data.get(off).is_some_and(|b| *b != 0);
         Ok(Self {
             virtual_token_reserves: u64_at(0),
             virtual_sol_reserves: u64_at(1),
@@ -77,6 +107,10 @@ impl BondingCurveState {
             real_sol_reserves: u64_at(3),
             token_total_supply: u64_at(4),
             complete: data[8 + 5 * 8] != 0,
+            creator: bytes32(CREATOR_OFFSET),
+            is_mayhem_mode: flag(MAYHEM_OFFSET),
+            is_cashback_coin: flag(CASHBACK_OFFSET),
+            quote_mint: bytes32(QUOTE_MINT_OFFSET),
         })
     }
 
@@ -143,15 +177,50 @@ mod tests {
             v.extend_from_slice(&x.to_le_bytes());
         }
         v.push(state.complete as u8);
-        v.extend(std::iter::repeat_n(7u8, extra));
+        v.extend(std::iter::repeat_n(0u8, extra));
         v
     }
 
     #[test]
-    fn parses_account_with_trailing_fields() {
+    fn parses_short_legacy_account() {
         let s = BondingCurveState::initial();
-        let parsed = BondingCurveState::from_account_data(&account_bytes(&s, 32)).unwrap();
+        let parsed = BondingCurveState::from_account_data(&account_bytes(&s, 0)).unwrap();
         assert_eq!(parsed, s);
+        assert!(parsed.is_sol_quoted());
+    }
+
+    /// Real mainnet bonding curve account (166 bytes), captured 2026-10-02.
+    /// Curve FjzSWshoB8msrGDpYnREYKYSpxoreQXTy5WvSCu8wq84 (SOL-quoted).
+    #[test]
+    fn parses_live_mainnet_account() {
+        let data = include_bytes!("../tests/fixtures/curve_sol.bin");
+        let c = BondingCurveState::from_account_data(data).unwrap();
+        assert_eq!(c.virtual_token_reserves, 1_006_145_946_337_782);
+        assert_eq!(c.virtual_sol_reserves, 31_993_370_469);
+        assert_eq!(c.real_token_reserves, 726_245_946_337_782);
+        assert_eq!(c.real_sol_reserves, 1_993_370_469);
+        assert!(!c.complete && !c.is_mayhem_mode && !c.is_cashback_coin);
+        assert!(c.is_sol_quoted());
+        assert_ne!(c.creator, [0; 32]);
+        // Virtual SOL = 30 SOL launch + real SOL raised.
+        assert_eq!(c.virtual_sol_reserves - c.real_sol_reserves, INITIAL_VIRTUAL_SOL_RESERVES);
+    }
+
+    /// Mainnet curve quoted in a pump coin, not SOL.
+    #[test]
+    fn detects_non_sol_quote() {
+        let data = include_bytes!("../tests/fixtures/curve_token_quoted.bin");
+        let c = BondingCurveState::from_account_data(data).unwrap();
+        assert!(!c.is_sol_quoted());
+    }
+
+    /// The fee constant must match what mainnet charged:
+    /// sell of 47_501_394 lamports gross paid fee 451_264 + creator 142_505.
+    #[test]
+    fn fee_matches_mainnet_trade_event() {
+        let gross: u64 = 47_501_394;
+        let fee = gross * DEFAULT_FEE_BPS / BPS_DENOMINATOR;
+        assert!(fee.abs_diff(451_264 + 142_505) <= 2, "{}", fee);
     }
 
     #[test]
